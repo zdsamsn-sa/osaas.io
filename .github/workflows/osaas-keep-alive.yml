@@ -1,0 +1,31 @@
+name: OSaaS My Apps Keep-Alive
+
+on:
+  schedule:
+    # 每 8 小时运行一次（UTC）
+    - cron: '0 */8 * * *'
+  workflow_dispatch:  # 支持手动触发
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install OSC CLI
+        run: npm install -g @osaas/cli
+
+      - name: Run Keep-Alive Script
+        env:
+          OSC_ACCESS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN }}
+        run: |
+          chmod +x scripts/keep-alive.sh
+          ./scripts/keep-alive.sh
