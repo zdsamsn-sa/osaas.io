@@ -2,14 +2,13 @@ name: OSaaS My Apps Keep-Alive
 
 on:
   schedule:
-    # 每 8 小时运行一次（UTC）
     - cron: '0 */8 * * *'
-  workflow_dispatch:  # 支持手动触发
+  workflow_dispatch:
 
 jobs:
   keep-alive:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -18,14 +17,18 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
-      - name: Install OSC CLI
-        run: npm install -g @osaas/cli
+      - name: Install dependencies
+        run: |
+          npm install -g @osaas/cli
+          npx -y playwright install chromium --with-deps
 
-      - name: Run Keep-Alive Script
+      - name: Run Keep-Alive
         env:
           OSC_ACCESS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           chmod +x scripts/keep-alive.sh
           ./scripts/keep-alive.sh
