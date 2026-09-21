@@ -19,10 +19,11 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install dependencies
+      - name: Install tools
         run: |
           npm install -g @osaas/cli
-          npx -y playwright install chromium --with-deps
+          npm install playwright
+          npx playwright install chromium --with-deps
 
       - name: Run Keep-Alive
         env:
