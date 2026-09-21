@@ -1,80 +1,53 @@
 # OSaaS My Apps Keep-Alive
 
-每 8 小时自动检查 https://app.osaas.io/dashboard/my-apps 中的应用。  
-如果未运行则执行 Resume（对应 CLI 的 `restart`），并等待变为 Running。
+每 8 小时检查 My Apps：
 
-## 登录与认证说明
+- **已是 Running 且 URL 可访问** → 直接跳过（与控制台绿点 Running 一致）
+- **不可访问** → 执行 `restart`（对应 UI Resume），等待恢复到可访问
+- 结果发送到 **Telegram**（文字 + 应用页面截图）
 
-OSaaS（app.osaas.io）支持以下登录方式：
+## 需要的 Secrets
 
-| 方式 | 说明 |
-|------|------|
-| Email 魔法链接 | 输入邮箱，收到一次性登录链接（无密码） |
-| GitHub OAuth | 用 GitHub 账号登录 |
-| Google OAuth | 用 Google 账号登录 |
-| Apple OAuth | 用 Apple ID 登录 |
-| Passkey | 通行密钥 |
+GitHub 仓库 → **Settings → Secrets and variables → Actions**：
 
-**重要**：每种登录方式会创建独立账号，即使邮箱相同也不会自动关联。
+| Secret 名称 | 说明 |
+|-------------|------|
+| `OSC_ACCESS_TOKEN` | OSaaS API Token（Settings → API → Create New Token） |
+| `TELEGRAM_BOT_TOKEN` | Telegram Bot Token（@BotFather） |
+| `TELEGRAM_CHAT_ID` | 接收消息的 Chat ID |
 
-**自动化 / GitHub Actions 必须使用 Personal Access Token（PAT）**，官方完全支持。
+### 获取 OSC_ACCESS_TOKEN
 
-### 获取 PAT
+1. https://app.osaas.io → **Settings → API**
+2. 点 **+ Create New Token**
+3. 复制 Token（只显示一次）
 
-1. 登录 https://app.osaas.io
-2. 左侧 **Settings** → **API** 标签
-3. 复制 Personal Access Token
+### 获取 Telegram
 
-## 快速使用（GitHub）
-
-1. 把本压缩包内容解压到你的 GitHub 仓库根目录（或新建仓库）
-2. 仓库 → **Settings** → **Secrets and variables** → **Actions**  
-   新建 Secret：
-   - Name: `OSC_ACCESS_TOKEN`
-   - Value: 你的 PAT
-3. 推送代码后，到 **Actions** 页面手动触发一次 “OSaaS My Apps Keep-Alive” 进行测试
-4. 之后会按 cron 每 8 小时自动运行
+1. [@BotFather](https://t.me/BotFather) → `/newbot` → 得到 `TELEGRAM_BOT_TOKEN`
+2. 私聊 Bot 或拉进群
+3. 打开 `https://api.telegram.org/bot<TOKEN>/getUpdates`，找 `chat.id` 作为 `TELEGRAM_CHAT_ID`
 
 ## 本地测试
 
 ```bash
-export OSC_ACCESS_TOKEN="你的PAT"
+export OSC_ACCESS_TOKEN="你的token"
+export TELEGRAM_BOT_TOKEN="可选"
+export TELEGRAM_CHAT_ID="可选"
+
 chmod +x scripts/keep-alive.sh
 ./scripts/keep-alive.sh
 ```
 
-需要先安装 Node.js 18+，脚本会自动通过 npx 使用 @osaas/cli。
+## 逻辑说明
 
-## 文件说明
+1. `osc myapp list` 得到应用名和 URL（如 zdsa → https://d5a4f3bcdd.apps.osaas.io）
+2. HTTP 探测 URL：可访问 → **跳过**（等同截图 Status=Running）
+3. 不可访问 → `osc restart eyevinn-web-runner <name>`，轮询直到可访问
+4. 截图应用公开页，连同结果发 Telegram
 
-```
-osaas-keepalive/
-├── .github/
-│   └── workflows/
-│       └── osaas-keep-alive.yml   # GitHub Actions 定时任务
-├── scripts/
-│   └── keep-alive.sh              # 核心检查与 Resume 脚本
-└── README.md
-```
+## 注意
 
-## 工作原理
-
-- UI 上的 “Resume” 对应 CLI 命令：`osc restart <serviceId> <name>`
-- 脚本会检查常见 runner：
-  - eyevinn-web-runner
-  - eyevinn-python-runner
-  - eyevinn-golang-runner
-  - eyevinn-dotnet-runner
-  - eyevinn-wasm-runner
-- 已处于 running / active / ready / healthy 状态的应用会跳过
-- 未运行的会执行 restart，并轮询等待变为 running（最多约 3 分钟）
-
-## 手动触发
-
-在 GitHub 仓库的 **Actions** 标签页，选择 “OSaaS My Apps Keep-Alive”，点击 **Run workflow**。
-
-## 注意事项
-
-- 请妥善保管 PAT，不要提交到代码仓库
-- 如需只监控某一个固定应用，可修改 `scripts/keep-alive.sh` 中的逻辑
-- 首次运行建议先本地测试，确认能正确列出你的实例
+- 免费计划应用可能休眠，定时 restart 可唤醒
+- 截图是应用公开 URL，不是需登录的控制台
+- 未配置 Telegram 时仍会 keep-alive，只是不发消息

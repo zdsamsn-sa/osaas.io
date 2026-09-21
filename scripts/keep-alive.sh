@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# OSaaS My Apps Keep-Alive
+# - 已 Running 且可访问 → 跳过
+# - 不可访问 → restart，等待恢复
+# - 结果发 Telegram（文字 + 应用页面截图）
+
 set -euo pipefail
 
 echo "========================================"
@@ -11,96 +16,167 @@ if [ -z "${OSC_ACCESS_TOKEN:-}" ]; then
   exit 1
 fi
 
-# 常见 My Apps 对应的 runner serviceId
-RUNNERS=(
-  "eyevinn-web-runner"
-  "eyevinn-python-runner"
-  "eyevinn-golang-runner"
-  "eyevinn-dotnet-runner"
-  "eyevinn-wasm-runner"
-)
+REPORT_FILE=$(mktemp)
+SCREENSHOT_DIR=$(mktemp -d)
+trap 'rm -f "$REPORT_FILE"; rm -rf "$SCREENSHOT_DIR"' EXIT
 
-echo ""
-echo "=== 1. List My Apps ==="
-npx @osaas/cli myapp list || true
+log() {
+  echo "$@" | tee -a "$REPORT_FILE"
+}
 
-echo ""
-echo "=== 2. Check and Resume instances ==="
-
-for serviceId in "${RUNNERS[@]}"; do
-  echo ""
-  echo "--- Service: $serviceId ---"
-
-  # 尝试获取实例列表
-  if ! instances_raw=$(npx @osaas/cli list "$serviceId" 2>/dev/null); then
-    echo "  No instances or service not available"
-    continue
+# HTTP 健康检查：能连上即视为 Running（与控制台绿点一致）
+is_healthy() {
+  local url="$1"
+  local code
+  code=$(curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 20 -L "$url" 2>/dev/null || echo "000")
+  # 2xx/3xx 健康；部分应用根路径 404 但仍在跑，也接受
+  if [[ "$code" =~ ^(2|3)[0-9][0-9]$ ]] || [ "$code" = "404" ]; then
+    return 0
   fi
+  return 1
+}
 
-  # 如果没有实例
-  if echo "$instances_raw" | grep -qiE 'no instances|empty|\[\]' || [ -z "$instances_raw" ]; then
-    echo "  No instances found"
-    continue
+parse_myapps() {
+  npx -y @osaas/cli myapp list 2>/dev/null || true
+}
+
+do_restart() {
+  local name="$1"
+  log "  → 执行 restart: eyevinn-web-runner / $name"
+  if npx -y @osaas/cli restart eyevinn-web-runner "$name" 2>&1 | tee -a "$REPORT_FILE"; then
+    log "  Restart 命令已发送"
+    return 0
   fi
+  log "  ⚠ restart 失败"
+  return 1
+}
 
-  # 提取实例名（优先 JSON，否则简单文本解析）
-  if echo "$instances_raw" | jq -e . >/dev/null 2>&1; then
-    names=$(echo "$instances_raw" | jq -r '.[].name // empty' 2>/dev/null || true)
-  else
-    names=$(echo "$instances_raw" | grep -oE '[a-zA-Z0-9][a-zA-Z0-9_-]*' | head -20 || true)
-  fi
-
-  if [ -z "$names" ]; then
-    echo "  Could not parse instance names, printing raw output for debug:"
-    echo "$instances_raw"
-    continue
-  fi
-
-  for name in $names; do
-    # 过滤明显不是实例名的词
-    if [[ "$name" =~ ^(name|status|url|id|service|instance|list|create|remove|describe|restart)$ ]]; then
-      continue
+wait_healthy() {
+  local url="$1"
+  local name="$2"
+  local max_attempts=24
+  local i
+  for i in $(seq 1 "$max_attempts"); do
+    sleep 10
+    if is_healthy "$url"; then
+      log "  ✓ [$i/$max_attempts] $name 已恢复可访问 (Running)"
+      return 0
     fi
-
-    echo "  Checking instance: $name"
-
-    # 获取当前状态
-    status="unknown"
-    if desc=$(npx @osaas/cli describe "$serviceId" "$name" 2>/dev/null); then
-      status=$(echo "$desc" | grep -iE 'status|state|running|phase' | head -1 || echo "unknown")
-      echo "    Current: $status"
-    fi
-
-    # 判断是否需要 Resume
-    if echo "$status" | grep -qiE 'running|active|ready|healthy'; then
-      echo "    ✓ Already running → skip"
-    else
-      echo "    → Not running, executing resume (restart)..."
-      if npx @osaas/cli restart "$serviceId" "$name"; then
-        echo "    Restart command sent"
-
-        # 等待变成 running（最多约 3 分钟）
-        for i in $(seq 1 18); do
-          sleep 10
-          current=$(npx @osaas/cli describe "$serviceId" "$name" 2>/dev/null | grep -iE 'status|state|running|phase' | head -1 || echo "unknown")
-          echo "    [$i/18] status: $current"
-          if echo "$current" | grep -qiE 'running|active|ready|healthy'; then
-            echo "    ✓ $name is now running"
-            break
-          fi
-        done
-      else
-        echo "    ⚠ restart failed for $name (may already be starting or not exist)"
-      fi
-    fi
+    log "  [$i/$max_attempts] 仍不可访问，继续等待..."
   done
-done
+  log "  ✗ 等待超时，$name 仍未恢复"
+  return 1
+}
 
-echo ""
-echo "=== 3. Final My Apps list ==="
-npx @osaas/cli myapp list || true
+take_screenshot() {
+  local url="$1"
+  local out="$2"
+  npx -y playwright screenshot --wait-for-timeout=5000 "$url" "$out" 2>/dev/null || return 1
+  [ -f "$out" ] && [ -s "$out" ]
+}
 
-echo ""
-echo "========================================"
-echo " Keep-Alive finished"
-echo "========================================"
+tg_send_text() {
+  local text="$1"
+  if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+    log "Telegram 未配置，跳过发送文字"
+    return 0
+  fi
+  curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    -d chat_id="${TELEGRAM_CHAT_ID}" \
+    -d parse_mode="HTML" \
+    --data-urlencode "text=${text}" \
+    >/dev/null || log "⚠ Telegram 文字发送失败"
+}
+
+tg_send_photo() {
+  local photo="$1"
+  local caption="$2"
+  if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+    return 0
+  fi
+  if [ ! -f "$photo" ] || [ ! -s "$photo" ]; then
+    return 0
+  fi
+  curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" \
+    -F chat_id="${TELEGRAM_CHAT_ID}" \
+    -F photo="@${photo}" \
+    -F caption="${caption}" \
+    >/dev/null || log "⚠ Telegram 图片发送失败"
+}
+
+# ---------- main ----------
+
+log ""
+log "=== 1. List My Apps ==="
+MYAPPS_RAW=$(parse_myapps)
+log "$MYAPPS_RAW"
+
+if [ -z "$MYAPPS_RAW" ]; then
+  log "未找到任何 My Apps，结束"
+  tg_send_text "OSaaS Keep-Alive: 未找到任何 My Apps"
+  exit 0
+fi
+
+log ""
+log "=== 2. 检查并按需 Resume ==="
+
+while IFS= read -r line; do
+  if ! echo "$line" | grep -qE 'https?://'; then
+    continue
+  fi
+
+  name=$(echo "$line" | sed -E 's/^[[:space:]]*([a-zA-Z0-9_-]+).*/\1/')
+  url=$(echo "$line" | grep -oE 'https?://[^[:space:]]+' | head -1)
+
+  if [ -z "$name" ] || [ -z "$url" ]; then
+    continue
+  fi
+
+  log ""
+  log "--- App: $name ---"
+  log "  URL: $url"
+
+  if is_healthy "$url"; then
+    log "  ✓ 已在 Running 且可访问 → 跳过（与控制台 Running 一致）"
+    RESULT="SKIP (already Running)"
+  else
+    log "  → 不可访问，执行 Resume (restart)..."
+    if do_restart "$name"; then
+      if wait_healthy "$url" "$name"; then
+        RESULT="RESUMED → Running"
+      else
+        RESULT="RESUMED but still unhealthy"
+      fi
+    else
+      RESULT="RESTART FAILED"
+    fi
+  fi
+
+  log "  结果: $RESULT"
+
+  shot="${SCREENSHOT_DIR}/${name}.png"
+  if take_screenshot "$url" "$shot"; then
+    log "  截图已保存: $shot"
+    tg_send_photo "$shot" "OSaaS ${name}: ${RESULT}
+${url}"
+  else
+    log "  截图失败（将只发文字）"
+    tg_send_text "OSaaS <b>${name}</b>: ${RESULT}
+${url}"
+  fi
+done <<< "$MYAPPS_RAW"
+
+log ""
+log "=== 3. 最终 My Apps 列表 ==="
+parse_myapps | tee -a "$REPORT_FILE" || true
+
+log ""
+log "========================================"
+log " Keep-Alive finished"
+log "========================================"
+
+SUMMARY=$(cat "$REPORT_FILE" | tail -c 3500)
+tg_send_text "OSaaS Keep-Alive 完成
+$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+<pre>${SUMMARY}</pre>" || true
