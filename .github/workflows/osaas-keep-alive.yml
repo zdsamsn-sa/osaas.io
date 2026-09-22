@@ -8,7 +8,7 @@ on:
 jobs:
   keep-alive:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -28,9 +28,10 @@ jobs:
       - name: Run Keep-Alive
         env:
           OSC_ACCESS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN }}
+          # 强烈建议：浏览器登录后的 Cookie，用于真正打开控制台并点 Resume
+          OSC_SESSION_COOKIE: ${{ secrets.OSC_SESSION_COOKIE }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # 可选：多个应用空格分隔；URL 在 Suspended 时 list 可能为空
           OSAAS_APP_NAMES: ${{ vars.OSAAS_APP_NAMES || 'zdsa' }}
           OSAAS_APP_URL: ${{ vars.OSAAS_APP_URL || 'https://d5a4f3bcdd.apps.osaas.io' }}
         run: |
