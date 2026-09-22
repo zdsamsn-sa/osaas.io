@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # OSaaS My Apps Keep-Alive
-# 目标：找到 Suspended 的 Resume → 执行 → 等到 Running / URL 可访问
+# 打开 https://app.osaas.io/dashboard/my-apps ，点击 Suspended 的 Resume，等到 Running
 
 set -euo pipefail
 
@@ -18,71 +18,181 @@ REPORT_FILE=$(mktemp)
 SCREENSHOT_DIR=$(mktemp -d)
 trap 'rm -f "$REPORT_FILE"; rm -rf "$SCREENSHOT_DIR"' EXIT
 
-log() {
-  echo "$@" | tee -a "$REPORT_FILE"
-}
+log() { echo "$@" | tee -a "$REPORT_FILE"; }
 
 is_healthy() {
   local url="$1"
   local code
   code=$(curl -sS -o /dev/null -w "%{http_code}" --connect-timeout 10 --max-time 20 -L "$url" 2>/dev/null || echo "000")
-  if [[ "$code" =~ ^(2|3)[0-9][0-9]$ ]] || [ "$code" = "404" ]; then
-    return 0
-  fi
-  return 1
+  [[ "$code" =~ ^(2|3)[0-9][0-9]$ ]] || [ "$code" = "404" ]
 }
 
 parse_myapps() {
   npx -y @osaas/cli myapp list 2>/dev/null || true
 }
 
-# 控制台 Suspended 的绿色 Resume ≈ 把副本从 0 拉回 1
-do_resume() {
-  local name="$1"
-  log "  → Resume: set-instance-replicas eyevinn-web-runner $name 1"
-  if npx -y @osaas/cli set-instance-replicas eyevinn-web-runner "$name" 1 2>&1 | tee -a "$REPORT_FILE"; then
-    log "  set-instance-replicas 已发送"
-  else
-    log "  ⚠ set-instance-replicas 失败（可能 token 耗尽或权限不足）"
-  fi
-  # 再尝试 restart 作为兜底
-  log "  → 兜底 restart eyevinn-web-runner $name"
-  npx -y @osaas/cli restart eyevinn-web-runner "$name" 2>&1 | tee -a "$REPORT_FILE" || true
-}
+# ---------- 核心：浏览器打开 My Apps，点击 Resume ----------
+# 返回 0=成功点到并开始恢复；1=失败
+click_resume_on_dashboard() {
+  local app_name="${1:-zdsa}"
+  local shot_before="${SCREENSHOT_DIR}/dashboard-before.png"
+  local shot_after="${SCREENSHOT_DIR}/dashboard-after.png"
+  export APP_NAME="$app_name"
+  export SHOT_BEFORE="$shot_before"
+  export SHOT_AFTER="$shot_after"
+  export OSC_ACCESS_TOKEN
+  export OSC_SESSION_COOKIE="${OSC_SESSION_COOKIE:-}"
 
-wait_healthy() {
-  local url="$1"
-  local name="$2"
-  local max_attempts=30   # 约 5 分钟（Resume 后起 pod 约 10–30s，token 恢复可能更久）
-  local i
-  for i in $(seq 1 "$max_attempts"); do
-    sleep 10
-    if is_healthy "$url"; then
-      log "  ✓ [$i/$max_attempts] $name 已 Running / 可访问"
-      return 0
-    fi
-    log "  [$i/$max_attempts] 等待 Running..."
-  done
-  log "  ✗ 等待超时，仍未 Running"
-  return 1
-}
-
-shot_app_page() {
-  local url="$1"
-  local out="$2"
-  export SHOT_URL="$url" SHOT_OUT="$out"
   node <<'NODE'
 const { chromium } = require('playwright');
+
 (async () => {
+  const token = process.env.OSC_ACCESS_TOKEN;
+  const appName = process.env.APP_NAME || 'zdsa';
+  const cookieHeader = process.env.OSC_SESSION_COOKIE || '';
+
   const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  const context = await browser.newContext({
+    viewport: { width: 1440, height: 900 },
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  });
+
+  // 可选：用户提供的登录 Cookie（从浏览器复制），格式 name=value; name2=value2
+  if (cookieHeader.trim()) {
+    const cookies = cookieHeader.split(';').map((p) => {
+      const [name, ...rest] = p.trim().split('=');
+      return {
+        name: name.trim(),
+        value: rest.join('=').trim(),
+        domain: '.osaas.io',
+        path: '/',
+      };
+    }).filter((c) => c.name && c.value);
+    if (cookies.length) await context.addCookies(cookies);
+  }
+
+  const page = await context.newPage();
+
+  // 给所有请求带上 PAT（部分 API 认 x-pat-jwt / Authorization）
+  await page.route('**/*', async (route) => {
+    const headers = {
+      ...route.request().headers(),
+      authorization: `Bearer ${token}`,
+      'x-pat-jwt': `Bearer ${token}`,
+    };
+    try {
+      await route.continue({ headers });
+    } catch {
+      await route.continue();
+    }
+  });
+
   try {
-    await page.goto(process.env.SHOT_URL, { waitUntil: 'networkidle', timeout: 45000 });
-    await page.waitForTimeout(2500);
-    await page.screenshot({ path: process.env.SHOT_OUT, fullPage: true, type: 'png' });
-    console.log('app_shot_ok');
+    // 写入可能用到的 localStorage key
+    await page.goto('https://app.osaas.io/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.evaluate((t) => {
+      try {
+        localStorage.setItem('osc_access_token', t);
+        localStorage.setItem('access_token', t);
+        localStorage.setItem('token', t);
+        localStorage.setItem('pat', t);
+        localStorage.setItem('OSC_ACCESS_TOKEN', t);
+      } catch (_) {}
+    }, token);
+
+    await page.goto('https://app.osaas.io/dashboard/my-apps', {
+      waitUntil: 'networkidle',
+      timeout: 60000,
+    });
+    await page.waitForTimeout(4000);
+
+    // 截图：操作前
+    await page.screenshot({ path: process.env.SHOT_BEFORE, fullPage: true, type: 'png' }).catch(() => {});
+
+    const bodyText = await page.locator('body').innerText().catch(() => '');
+
+    // 仍在登录页
+    if (/Continue with|Sign in|magic link|one-time password|登录/i.test(bodyText) &&
+        !/Suspended Apps|My Apps|Resume/i.test(bodyText)) {
+      console.error('NEED_LOGIN: 页面需要浏览器登录态。请配置 Secret OSC_SESSION_COOKIE（从已登录浏览器复制 Cookie）');
+      process.exitCode = 2;
+      await browser.close();
+      return;
+    }
+
+    // 找 Resume 按钮：优先 Suspended 区域、含 app 名的行
+    let clicked = false;
+    const candidates = [
+      page.getByRole('button', { name: /Resume/i }),
+      page.locator('button:has-text("Resume")'),
+      page.locator('[class*="Suspended"] button:has-text("Resume")'),
+      page.locator(`text=${appName}`).locator('..').locator('button:has-text("Resume")'),
+      page.locator('button').filter({ hasText: /^Resume$/ }),
+    ];
+
+    for (const loc of candidates) {
+      const count = await loc.count().catch(() => 0);
+      if (count > 0) {
+        const btn = loc.first();
+        await btn.scrollIntoViewIfNeeded().catch(() => {});
+        await btn.click({ timeout: 10000 });
+        clicked = true;
+        console.log('CLICKED_RESUME');
+        break;
+      }
+    }
+
+    if (!clicked) {
+      // 可能已经在 Running，没有 Resume 按钮
+      if (/Running/i.test(bodyText) && new RegExp(appName, 'i').test(bodyText)) {
+        console.log('ALREADY_RUNNING');
+        process.exitCode = 0;
+      } else if (/token exhaustion|upgrading your plan|token balance/i.test(bodyText)) {
+        console.error('TOKEN_EXHAUSTED: 页面提示 token 耗尽，即使点 Resume 也可能被拒绝');
+        // 仍尝试点一次（若有按钮）
+        process.exitCode = 3;
+      } else {
+        console.error('NO_RESUME_BUTTON: 未找到 Resume 按钮');
+        process.exitCode = 1;
+      }
+      await page.screenshot({ path: process.env.SHOT_AFTER, fullPage: true, type: 'png' }).catch(() => {});
+      await browser.close();
+      return;
+    }
+
+    // 点击后等待状态变化
+    await page.waitForTimeout(5000);
+    // 可能出现确认对话框
+    const confirm = page.getByRole('button', { name: /Confirm|OK|Yes|Resume/i });
+    if (await confirm.count().catch(() => 0)) {
+      await confirm.first().click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(3000);
+    }
+
+    // 轮询页面直到出现 Running 或超时
+    let ok = false;
+    for (let i = 0; i < 24; i++) {
+      await page.reload({ waitUntil: 'networkidle', timeout: 60000 }).catch(() => {});
+      await page.waitForTimeout(5000);
+      const t = await page.locator('body').innerText().catch(() => '');
+      if (new RegExp(appName, 'i').test(t) && /Running/i.test(t) && !/Suspended/i.test(t.split(appName)[1]?.slice(0, 80) || '')) {
+        ok = true;
+        console.log('STATUS_RUNNING');
+        break;
+      }
+      // Suspended 区域消失也算进展
+      if (new RegExp(appName, 'i').test(t) && !/Suspended Apps[\s\S]{0,200}Resume/i.test(t)) {
+        // 可能在恢复中
+        console.log('RESUME_IN_PROGRESS', i);
+      }
+    }
+
+    await page.screenshot({ path: process.env.SHOT_AFTER, fullPage: true, type: 'png' }).catch(() => {});
+    process.exitCode = ok ? 0 : 4;
+    if (!ok) console.error('WAIT_TIMEOUT: 点击 Resume 后仍未看到 Running（可能 token 不足）');
   } catch (e) {
-    console.error('app_shot_fail:', e.message);
+    console.error('BROWSER_ERROR:', e.message);
     process.exitCode = 1;
   } finally {
     await browser.close();
@@ -109,91 +219,135 @@ tg_send_photo() {
     -F caption="${caption}" >/dev/null 2>&1 || true
 }
 
+shot_app() {
+  local url="$1" out="$2"
+  export SHOT_URL="$url" SHOT_OUT="$out"
+  node <<'NODE'
+const { chromium } = require('playwright');
+(async () => {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  try {
+    await page.goto(process.env.SHOT_URL, { waitUntil: 'networkidle', timeout: 45000 });
+    await page.waitForTimeout(2000);
+    await page.screenshot({ path: process.env.SHOT_OUT, fullPage: true, type: 'png' });
+    console.log('app_shot_ok');
+  } catch (e) {
+    console.error('app_shot_fail', e.message);
+    process.exitCode = 1;
+  } finally {
+    await browser.close();
+  }
+})();
+NODE
+}
+
 # ---------- main ----------
-
-log ""
-log "=== 1. List My Apps ==="
-MYAPPS_RAW=$(parse_myapps)
-log "$MYAPPS_RAW"
-
-# 即使 myapp list 为空，仍尝试对已知实例名做 Resume（Suspended 时 list 可能为空）
-# 可从环境变量指定，默认 zdsa
-APP_NAMES="${OSAAS_APP_NAMES:-zdsa}"
-
-if [ -z "$MYAPPS_RAW" ]; then
-  log "myapp list 为空（可能全部 Suspended），将按预设名称尝试 Resume: $APP_NAMES"
-fi
-
+APP_NAME="${OSAAS_APP_NAMES:-zdsa}"
+APP_URL="${OSAAS_APP_URL:-https://d5a4f3bcdd.apps.osaas.io}"
 UTC_NOW=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
 
-# 收集要处理的 name + url
-declare -A APP_URLS
-while IFS= read -r line; do
-  if ! echo "$line" | grep -qE 'https?://'; then continue; fi
-  n=$(echo "$line" | sed -E 's/^[[:space:]]*([a-zA-Z0-9_-]+).*/\1/')
-  u=$(echo "$line" | grep -oE 'https?://[^[:space:]]+' | head -1 | sed 's/[.,;:)]$//')
-  [ -n "$n" ] && [ -n "$u" ] && APP_URLS["$n"]="$u"
-done <<< "$MYAPPS_RAW"
-
-# 确保预设名称也在列表里（Suspended 时可能没有 URL）
-for n in $APP_NAMES; do
-  if [ -z "${APP_URLS[$n]:-}" ]; then
-    # 常见公开域名形态；你的实例是 d5a4f3bcdd.apps.osaas.io
-    APP_URLS["$n"]="${OSAAS_APP_URL:-https://d5a4f3bcdd.apps.osaas.io}"
-  fi
-done
+log ""
+log "=== 1. List My Apps (CLI) ==="
+MYAPPS_RAW=$(parse_myapps)
+log "${MYAPPS_RAW:-（空 — 可能全部 Suspended）}"
 
 log ""
-log "=== 2. 检查 / Resume / 等待 Running ==="
+log "=== 2. 打开控制台并点击 Resume ==="
+log "  页面: https://app.osaas.io/dashboard/my-apps"
+log "  应用: $APP_NAME"
 
-for name in "${!APP_URLS[@]}"; do
-  url="${APP_URLS[$name]}"
-  log ""
-  log "--- App: $name ---"
-  log "  URL: $url"
+STATUS="Unknown"
+ACTION="未执行"
+CONCLUSION=""
 
-  if is_healthy "$url"; then
-    log "  ✓ 已 Running → 跳过 Resume"
-    ACTION="无需启动（已在运行）"
-    STATUS="Running / Online"
-    CONCLUSION="应用在线，跳过 Resume"
-  else
-    log "  → 不可访问（可能 Suspended），执行 Resume..."
-    do_resume "$name"
-    if wait_healthy "$url" "$name"; then
-      ACTION="已点击 Resume（set replicas=1 + restart），服务器已 Online"
-      STATUS="Running / Online"
-      CONCLUSION="Resume 成功，应用已恢复"
-    else
-      ACTION="已尝试 Resume，仍未恢复"
+if is_healthy "$APP_URL"; then
+  log "  ✓ 应用 URL 已可访问 → 跳过 Resume"
+  STATUS="Running / Online"
+  ACTION="无需启动（已在运行）"
+  CONCLUSION="应用在线，跳过 Resume"
+else
+  log "  → URL 不可访问，使用浏览器点击 Resume..."
+  set +e
+  OUT=$(click_resume_on_dashboard "$APP_NAME" 2>&1)
+  RC=$?
+  set -e
+  log "$OUT"
+
+  # 发送控制台截图
+  [ -f "${SCREENSHOT_DIR}/dashboard-before.png" ] && \
+    tg_send_photo "${SCREENSHOT_DIR}/dashboard-before.png" "My Apps 点击前
+https://app.osaas.io/dashboard/my-apps"
+  [ -f "${SCREENSHOT_DIR}/dashboard-after.png" ] && \
+    tg_send_photo "${SCREENSHOT_DIR}/dashboard-after.png" "My Apps 点击后"
+
+  case $RC in
+    0)
+      if echo "$OUT" | grep -q ALREADY_RUNNING; then
+        STATUS="Running / Online"
+        ACTION="页面已是 Running，未点 Resume"
+        CONCLUSION="应用已在运行"
+      else
+        STATUS="Running / Online"
+        ACTION="已在控制台点击 Resume"
+        CONCLUSION="Resume 成功，应用已恢复"
+      fi
+      ;;
+    2)
+      STATUS="Need Login"
+      ACTION="无法进入控制台（缺少网页登录态）"
+      CONCLUSION="请添加 Secret OSC_SESSION_COOKIE：浏览器登录 app.osaas.io 后复制 Cookie"
+      ;;
+    3)
+      STATUS="Suspended (token exhausted)"
+      ACTION="检测到 token 耗尽提示"
+      CONCLUSION="请升级计划或等额度恢复后再 Resume"
+      ;;
+    4)
       STATUS="Suspended / Unhealthy"
-      CONCLUSION="可能因免费额度 token 耗尽无法 Resume。请升级计划或等额度恢复后重试。"
-    fi
-  fi
+      ACTION="已点击 Resume，但未变为 Running"
+      CONCLUSION="可能仍因 token 耗尽被拒绝，请检查额度"
+      ;;
+    *)
+      STATUS="Failed"
+      ACTION="浏览器自动化失败"
+      CONCLUSION="查看 Actions 日志；或配置 OSC_SESSION_COOKIE"
+      ;;
+  esac
 
-  # 应用页截图
-  app_shot="${SCREENSHOT_DIR}/${name}-app.png"
-  if shot_app_page "$url" "$app_shot" 2>&1 | tee -a "$REPORT_FILE" | grep -q app_shot_ok; then
-    log "  ✓ 应用页截图成功"
-    tg_send_photo "$app_shot" "应用页面 ${name}
-${url}"
-  else
-    log "  ⚠ 应用页截图失败（未 Running 时常见）"
+  # 再等一会用 HTTP 确认
+  if ! is_healthy "$APP_URL"; then
+    for i in $(seq 1 12); do
+      sleep 10
+      if is_healthy "$APP_URL"; then
+        STATUS="Running / Online"
+        CONCLUSION="Resume 后 URL 已可访问"
+        break
+      fi
+      log "  [$i/12] 等待 URL 可访问..."
+    done
   fi
+fi
 
-  # SkyMC 风格报告
-  REPORT_MSG="✅ OSaaS 保活已执行
-应用: ${name}
+# 应用页截图
+app_shot="${SCREENSHOT_DIR}/app.png"
+if shot_app "$APP_URL" "$app_shot" 2>&1 | tee -a "$REPORT_FILE" | grep -q app_shot_ok; then
+  tg_send_photo "$app_shot" "应用页面 ${APP_NAME}
+${APP_URL}"
+fi
+
+REPORT_MSG="✅ OSaaS 保活已执行
+应用: ${APP_NAME}
 当前状态: ${STATUS}
 启动操作: ${ACTION}
-应用地址: ${url}
+应用地址: ${APP_URL}
+控制台: https://app.osaas.io/dashboard/my-apps
 执行时间: ${UTC_NOW}
 结论: ${CONCLUSION}"
 
-  log ""
-  log "$REPORT_MSG"
-  tg_send_text "$REPORT_MSG"
-done
+log ""
+log "$REPORT_MSG"
+tg_send_text "$REPORT_MSG"
 
 log ""
 log "=== 3. 最终 My Apps 列表 ==="

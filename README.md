@@ -1,53 +1,41 @@
 # OSaaS My Apps Keep-Alive
 
-每 8 小时检查 My Apps：
+自动打开 [My Apps](https://app.osaas.io/dashboard/my-apps)，在 **Suspended Apps** 上点击绿色 **Resume**，并等待变为 Running。
 
-- **已是 Running 且 URL 可访问** → 直接跳过（与控制台绿点 Running 一致）
-- **不可访问** → 执行 `restart`（对应 UI Resume），等待恢复到可访问
-- 结果发送到 **Telegram**（文字 + 应用页面截图）
+每 8 小时运行一次（也可手动触发）。
 
-## 需要的 Secrets
+## Secrets（仓库 Settings → Secrets → Actions）
 
-GitHub 仓库 → **Settings → Secrets and variables → Actions**：
+| 名称 | 必填 | 说明 |
+|------|------|------|
+| `OSC_ACCESS_TOKEN` | 是 | Settings → API → Create Token |
+| `OSC_SESSION_COOKIE` | **强烈建议** | 已登录浏览器的 Cookie，才能真正点到 Resume |
+| `TELEGRAM_BOT_TOKEN` | 否 | Telegram Bot |
+| `TELEGRAM_CHAT_ID` | 否 | 接收通知的 Chat ID |
 
-| Secret 名称 | 说明 |
-|-------------|------|
-| `OSC_ACCESS_TOKEN` | OSaaS API Token（Settings → API → Create New Token） |
-| `TELEGRAM_BOT_TOKEN` | Telegram Bot Token（@BotFather） |
-| `TELEGRAM_CHAT_ID` | 接收消息的 Chat ID |
+### 如何获取 `OSC_SESSION_COOKIE`
 
-### 获取 OSC_ACCESS_TOKEN
+1. 用 Chrome 登录 https://app.osaas.io  
+2. 打开开发者工具 (F12) → **Application** → **Cookies** → `https://app.osaas.io`  
+3. 复制全部 Cookie，拼成一行：`name1=value1; name2=value2; ...`  
+4. 粘贴到 GitHub Secret `OSC_SESSION_COOKIE`  
 
-1. https://app.osaas.io → **Settings → API**
-2. 点 **+ Create New Token**
-3. 复制 Token（只显示一次）
+Cookie 会过期，失效后重新复制一次。
 
-### 获取 Telegram
+## 逻辑
 
-1. [@BotFather](https://t.me/BotFather) → `/newbot` → 得到 `TELEGRAM_BOT_TOKEN`
-2. 私聊 Bot 或拉进群
-3. 打开 `https://api.telegram.org/bot<TOKEN>/getUpdates`，找 `chat.id` 作为 `TELEGRAM_CHAT_ID`
+1. 探测应用 URL 是否可访问 → 可访问则跳过  
+2. 否则用 Playwright 打开 `https://app.osaas.io/dashboard/my-apps`  
+3. 找到 **Resume** 按钮并点击  
+4. 等待页面出现 Running / URL 可访问  
+5. 发 Telegram：控制台截图 + 应用页截图 + 文字报告  
 
-## 本地测试
+## 注意：token 耗尽
 
-```bash
-export OSC_ACCESS_TOKEN="你的token"
-export TELEGRAM_BOT_TOKEN="可选"
-export TELEGRAM_CHAT_ID="可选"
+若页面提示 *suspended due to token exhaustion*，平台会拒绝 Resume。  
+需 **升级计划** 或 **等待额度恢复** 后，自动化才能成功。
 
-chmod +x scripts/keep-alive.sh
-./scripts/keep-alive.sh
-```
+## 可选变量（Settings → Variables）
 
-## 逻辑说明
-
-1. `osc myapp list` 得到应用名和 URL（如 zdsa → https://d5a4f3bcdd.apps.osaas.io）
-2. HTTP 探测 URL：可访问 → **跳过**（等同截图 Status=Running）
-3. 不可访问 → `osc restart eyevinn-web-runner <name>`，轮询直到可访问
-4. 截图应用公开页，连同结果发 Telegram
-
-## 注意
-
-- 免费计划应用可能休眠，定时 restart 可唤醒
-- 截图是应用公开 URL，不是需登录的控制台
-- 未配置 Telegram 时仍会 keep-alive，只是不发消息
+- `OSAAS_APP_NAMES` 默认 `zdsa`  
+- `OSAAS_APP_URL` 默认 `https://d5a4f3bcdd.apps.osaas.io`
