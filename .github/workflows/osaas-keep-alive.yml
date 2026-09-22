@@ -30,6 +30,9 @@ jobs:
           OSC_ACCESS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # 可选：多个应用空格分隔；URL 在 Suspended 时 list 可能为空
+          OSAAS_APP_NAMES: ${{ vars.OSAAS_APP_NAMES || 'zdsa' }}
+          OSAAS_APP_URL: ${{ vars.OSAAS_APP_URL || 'https://d5a4f3bcdd.apps.osaas.io' }}
         run: |
           chmod +x scripts/keep-alive.sh
           ./scripts/keep-alive.sh
